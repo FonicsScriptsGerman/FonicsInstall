@@ -1,0 +1,381 @@
+#!/bin/bash
+
+# ============================================================
+# FiveM FXServer Installer
+# Game Port : 40200 TCP/UDP
+# txAdmin   : 40201 TCP
+# Install   : /home/fivem/server
+# Service   : fivem.service
+# ============================================================
+
+set -e
+
+# -----------------------------
+# Einstellungen
+# -----------------------------
+
+FIVEM_USER="fivem"
+FIVEM_HOME="/home/fivem"
+SERVER_DIR="/home/fivem/server"
+DATA_DIR="/home/fivem/server-data"
+
+GAME_PORT="40200"
+TXADMIN_PORT="40201"
+
+ARTIFACT_BASE="https://runtime.fivem.net/artifacts/fivem/build_proot_linux/master"
+
+SERVICE_FILE="/etc/systemd/system/fivem.service"
+
+# -----------------------------
+# Root prüfen
+# -----------------------------
+
+if [ "$EUID" -ne 0 ]; then
+    echo "Bitte das Script als root ausführen."
+    echo "Beispiel:"
+    echo "sudo bash install.sh"
+    exit 1
+fi
+
+echo ""
+echo "=============================================="
+echo "        FiveM FXServer Installation"
+echo "=============================================="
+echo ""
+echo "Game Port : $GAME_PORT"
+echo "txAdmin   : $TXADMIN_PORT"
+echo ""
+
+# -----------------------------
+# System aktualisieren
+# -----------------------------
+
+echo "[1/10] System aktualisieren..."
+
+apt-get update -y
+apt-get upgrade -y
+
+# -----------------------------
+# Pakete installieren
+# -----------------------------
+
+echo "[2/10] Abhängigkeiten installieren..."
+
+apt-get install -y \
+    curl \
+    wget \
+    xz-utils \
+    tar \
+    git \
+    ca-certificates \
+    unzip \
+    jq \
+    ufw \
+    screen \
+    nano
+
+# -----------------------------
+# FiveM Benutzer erstellen
+# -----------------------------
+
+echo "[3/10] FiveM Benutzer erstellen..."
+
+if ! id "$FIVEM_USER" >/dev/null 2>&1; then
+    useradd \
+        --system \
+        --create-home \
+        --home-dir "$FIVEM_HOME" \
+        --shell /bin/bash \
+        "$FIVEM_USER"
+fi
+
+mkdir -p "$SERVER_DIR"
+mkdir -p "$DATA_DIR"
+
+chown -R "$FIVEM_USER:$FIVEM_USER" "$FIVEM_HOME"
+
+# -----------------------------
+# Artifact automatisch finden
+# -----------------------------
+
+echo "[4/10] Aktuelles FiveM Artifact suchen..."
+
+ARTIFACT_PAGE=$(curl -fsSL "$ARTIFACT_BASE/")
+
+ARTIFACT_FILE=$(echo "$ARTIFACT_PAGE" \
+    | grep -oE 'href="[^"]+fx\.tar\.xz"' \
+    | sed 's/href="//' \
+    | sed 's/"//' \
+    | tail -n 1)
+
+if [ -z "$ARTIFACT_FILE" ]; then
+    echo ""
+    echo "FEHLER: Kein FiveM Artifact gefunden."
+    echo "Artifact-Seite:"
+    echo "$ARTIFACT_BASE"
+    exit 1
+fi
+
+# Falls nur Dateiname geliefert wurde
+if [[ "$ARTIFACT_FILE" == /* ]]; then
+    ARTIFACT_URL="https://runtime.fivem.net$ARTIFACT_FILE"
+elif [[ "$ARTIFACT_FILE" == http* ]]; then
+    ARTIFACT_URL="$ARTIFACT_FILE"
+else
+    ARTIFACT_URL="$ARTIFACT_BASE/$ARTIFACT_FILE"
+fi
+
+echo ""
+echo "Artifact:"
+echo "$ARTIFACT_URL"
+echo ""
+
+# -----------------------------
+# Artifact herunterladen
+# -----------------------------
+
+echo "[5/10] FiveM Artifact herunterladen..."
+
+rm -rf "$SERVER_DIR"/*
+mkdir -p "$SERVER_DIR"
+
+cd "$SERVER_DIR"
+
+wget \
+    --progress=bar:force \
+    -O fx.tar.xz \
+    "$ARTIFACT_URL"
+
+# -----------------------------
+# Artifact entpacken
+# -----------------------------
+
+echo "[6/10] FiveM Artifact entpacken..."
+
+tar -xf fx.tar.xz
+
+rm -f fx.tar.xz
+
+chown -R "$FIVEM_USER:$FIVEM_USER" "$SERVER_DIR"
+
+# -----------------------------
+# server.cfg erstellen
+# -----------------------------
+
+echo "[7/10] server.cfg erstellen..."
+
+cat > "$DATA_DIR/server.cfg" <<EOF
+# ============================================================
+# FiveM Server Configuration
+# ============================================================
+
+# Netzwerk
+endpoint_add_udp "0.0.0.0:${GAME_PORT}"
+endpoint_add_tcp "0.0.0.0:${GAME_PORT}"
+
+# Servername
+sv_hostname "Mein FiveM Server"
+
+# Maximale Spielerzahl
+sv_maxclients 48
+
+# Sprache
+sets locale "de-DE"
+
+# Tags
+sets tags "germany,deutsch,roleplay,fivem"
+
+# Beschreibung
+sets sv_projectDesc "Mein eigener FiveM Server"
+
+# Projektname
+sets sv_projectName "Mein FiveM Server"
+
+# Server Version
+sv_scriptHookAllowed 0
+
+# OneSync
+set onesync on
+
+# Steam Web API
+# set steam_webApiKey "DEIN_STEAM_API_KEY"
+
+# Lizenzschlüssel
+# HIER DEINEN CFX SERVER KEY EINTRAGEN
+sv_licenseKey "CHANGE_ME"
+
+# Standard-Ressourcen
+ensure mapmanager
+ensure chat
+ensure spawnmanager
+ensure sessionmanager
+ensure basic-gamemode
+ensure hardcap
+ensure rconlog
+
+# Voice
+setr voice_useNativeAudio true
+setr voice_useSendingRangeOnly true
+
+# Logging
+set logfile "server.log"
+EOF
+
+chown "$FIVEM_USER:$FIVEM_USER" "$DATA_DIR/server.cfg"
+
+# -----------------------------
+# txAdmin Konfiguration
+# -----------------------------
+
+echo "[8/10] txAdmin konfigurieren..."
+
+mkdir -p "$DATA_DIR"
+
+chown -R "$FIVEM_USER:$FIVEM_USER" "$DATA_DIR"
+
+# -----------------------------
+# systemd Service
+# -----------------------------
+
+echo "[9/10] systemd Service erstellen..."
+
+cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=FiveM FXServer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+
+Type=simple
+
+User=${FIVEM_USER}
+Group=${FIVEM_USER}
+
+WorkingDirectory=${DATA_DIR}
+
+ExecStart=${SERVER_DIR}/run.sh +exec server.cfg +set txAdminPort ${TXADMIN_PORT}
+
+Restart=always
+RestartSec=5
+
+LimitNOFILE=1048576
+
+KillSignal=SIGINT
+
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+chmod 644 "$SERVICE_FILE"
+
+# -----------------------------
+# Firewall
+# -----------------------------
+
+echo "[10/10] Firewall konfigurieren..."
+
+ufw allow 22/tcp
+
+# FiveM Game Port
+ufw allow "${GAME_PORT}/tcp"
+ufw allow "${GAME_PORT}/udp"
+
+# txAdmin
+ufw allow "${TXADMIN_PORT}/tcp"
+
+ufw --force enable
+
+# -----------------------------
+# systemd aktivieren
+# -----------------------------
+
+systemctl daemon-reload
+
+systemctl enable fivem.service
+
+# -----------------------------
+# Start
+# -----------------------------
+
+echo ""
+echo "=============================================="
+echo "FiveM Server wird gestartet..."
+echo "=============================================="
+echo ""
+
+systemctl restart fivem.service
+
+sleep 5
+
+# -----------------------------
+# Status
+# -----------------------------
+
+echo ""
+echo "=============================================="
+echo "           INSTALLATION FERTIG"
+echo "=============================================="
+echo ""
+
+systemctl --no-pager --full status fivem.service || true
+
+echo ""
+echo "----------------------------------------------"
+echo " FiveM Server"
+echo "----------------------------------------------"
+echo " Game Port : ${GAME_PORT}"
+echo " UDP       : ${GAME_PORT}"
+echo " TCP       : ${GAME_PORT}"
+echo ""
+
+echo "----------------------------------------------"
+echo " txAdmin"
+echo "----------------------------------------------"
+echo " Port      : ${TXADMIN_PORT}"
+echo ""
+
+echo "----------------------------------------------"
+echo " Verzeichnisse"
+echo "----------------------------------------------"
+echo " Server    : ${SERVER_DIR}"
+echo " Config    : ${DATA_DIR}/server.cfg"
+echo ""
+
+echo "----------------------------------------------"
+echo " Service"
+echo "----------------------------------------------"
+echo " Start     : systemctl start fivem"
+echo " Stop      : systemctl stop fivem"
+echo " Restart   : systemctl restart fivem"
+echo " Status    : systemctl status fivem"
+echo " Logs      : journalctl -u fivem -f"
+echo ""
+
+echo "----------------------------------------------"
+echo " WICHTIG"
+echo "----------------------------------------------"
+echo ""
+echo "Trage deinen Cfx.re Server-Key ein:"
+echo ""
+echo "nano ${DATA_DIR}/server.cfg"
+echo ""
+echo 'sv_licenseKey "DEIN_KEY"'
+echo ""
+
+echo "Danach:"
+echo "systemctl restart fivem"
+echo ""
+
+echo "txAdmin:"
+echo "http://SERVER-IP:${TXADMIN_PORT}"
+echo ""
+
+echo "FiveM:"
+echo "connect SERVER-IP:${GAME_PORT}"
+echo ""
+
+echo "Der Server startet nach einem Reboot automatisch."
+echo ""
